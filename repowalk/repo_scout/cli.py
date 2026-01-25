@@ -19,6 +19,18 @@ from .schema import (
     Surface,
     UserGoal,
 )
+from repowalk.walkthrough.generator import WalkthroughGenerator
+from repowalk.walkthrough.navigation import SearchNavigationBackend
+from repowalk.walkthrough.steps import (
+    BranchStep,
+    BoundaryStep,
+    DataStep,
+    OverviewStep,
+    RecapStep,
+    SurfaceStep,
+    TraceStep,
+    Walkthrough,
+)
 
 
 def main(argv=None) -> int:
@@ -46,33 +58,121 @@ def main(argv=None) -> int:
         help="Output format",
     )
 
+    walkthrough = subparsers.add_parser(
+        "walkthrough", help="Generate a walkthrough (Phase 2)"
+    )
+    walkthrough.add_argument("repo", nargs="?", default=".", help="Path to repo")
+    walkthrough.add_argument(
+        "--goal",
+        choices=[goal.value for goal in UserGoal],
+        default=UserGoal.DEBUG.value,
+        help="Walkthrough goal (default: debug)",
+    )
+    walkthrough.add_argument(
+        "--surface",
+        default="0",
+        help="Surface index or name (default: 0)",
+    )
+    walkthrough.add_argument(
+        "--list-surfaces",
+        action="store_true",
+        help="List detected surfaces and exit",
+    )
+    walkthrough.add_argument("--max-depth", type=int, default=8, help="Trace depth")
+    walkthrough.add_argument("--batch-size", type=int, default=5, help="Steps per batch")
+    walkthrough.add_argument(
+        "--llm",
+        choices=["litellm", "heuristic"],
+        default="heuristic",
+        help="LLM backend (heuristic is offline)",
+    )
+    walkthrough.add_argument(
+        "--model",
+        default="gpt-5.2",
+        help="LiteLLM model name (when using --llm litellm)",
+    )
+    walkthrough.add_argument(
+        "--output",
+        choices=["text", "json"],
+        default="text",
+        help="Output format",
+    )
+
     args = parser.parse_args(argv)
-    if args.command != "scout":
-        parser.print_help()
-        return 1
+    if args.command == "scout":
+        repo_path = Path(args.repo).resolve()
+        if args.llm == "heuristic":
+            llm = HeuristicLLMClient()
+        else:
+            llm = LiteLLMClient(model=args.model)
 
-    repo_path = Path(args.repo).resolve()
-    if args.llm == "heuristic":
-        llm = HeuristicLLMClient()
-    else:
-        llm = LiteLLMClient(model=args.model)
+        orientation = generate_orientation(repo_path, llm, max_depth=args.max_depth)
+        facts = gather_repo_facts(repo_path)
+        agent = RepoScoutAgent(llm)
+        analysis = agent.analyze(repo_path, facts, orientation)
 
-    orientation = generate_orientation(repo_path, llm, max_depth=args.max_depth)
-    facts = gather_repo_facts(repo_path)
-    agent = RepoScoutAgent(llm)
-    analysis = agent.analyze(repo_path, facts, orientation)
+        if args.output == "json":
+            payload = {
+                "orientation": orientation_to_dict(orientation),
+                "facts": facts_to_dict(facts),
+                "analysis": analysis_to_dict(analysis),
+            }
+            print(json.dumps(payload, indent=2))
+        else:
+            render_text_output(orientation, facts, analysis)
 
-    if args.output == "json":
-        payload = {
-            "orientation": orientation_to_dict(orientation),
-            "facts": facts_to_dict(facts),
-            "analysis": analysis_to_dict(analysis),
-        }
-        print(json.dumps(payload, indent=2))
-    else:
-        render_text_output(orientation, facts, analysis)
+        return 0
 
-    return 0
+    if args.command == "walkthrough":
+        repo_path = Path(args.repo).resolve()
+        if args.llm == "heuristic":
+            llm = HeuristicLLMClient()
+        else:
+            llm = LiteLLMClient(model=args.model)
+
+        orientation = generate_orientation(repo_path, llm, max_depth=args.max_depth)
+        facts = gather_repo_facts(repo_path)
+        agent = RepoScoutAgent(llm)
+        analysis = agent.analyze(repo_path, facts, orientation)
+
+        if args.list_surfaces:
+            print("SURFACES")
+            for idx, surface in enumerate(analysis.surfaces):
+                print(f"{idx}: {surface.name} ({surface.kind.value}) @ {surface.location}")
+            return 0
+
+        if not analysis.surfaces:
+            print("No surfaces detected. Try --llm litellm or inspect repo.")
+            return 1
+
+        try:
+            surface = select_surface(analysis.surfaces, args.surface)
+        except ValueError as exc:
+            print(str(exc))
+            return 1
+        goal = UserGoal(args.goal)
+
+        navigation = SearchNavigationBackend(repo_path)
+        generator = WalkthroughGenerator(
+            analysis=analysis,
+            navigation=navigation,
+            max_depth=args.max_depth,
+            batch_size=args.batch_size,
+        )
+        walkthrough = generator.start(goal, surface)
+        while walkthrough.has_more:
+            generator.continue_walkthrough()
+
+        if args.output == "json":
+            payload = walkthrough_to_dict(walkthrough)
+            print(json.dumps(payload, indent=2))
+        else:
+            render_walkthrough_text(walkthrough)
+
+        return 0
+
+    parser.print_help()
+    return 1
 
 
 def render_text_output(
@@ -90,6 +190,28 @@ def render_text_output(
     print(f"Purpose: {analysis.purpose}")
     print(f"Facets: {analysis.facets}")
     print(f"Surfaces: {[s.name for s in analysis.surfaces]}")
+
+
+def render_walkthrough_text(walkthrough: Walkthrough) -> None:
+    steps = []
+    for chapter in walkthrough.chapters:
+        steps.extend(chapter.steps)
+
+    print("PHASE 2: WALKTHROUGH")
+    print(f"Goal: {walkthrough.goal}")
+    print(f"Surface: {walkthrough.surface}")
+    if not steps:
+        print("No steps generated.")
+        return
+    print("\nSTEPS")
+    for idx, step in enumerate(steps, start=1):
+        location = step.location or "-"
+        print(f"{idx:02d}. {step.type.value}: {step.title} [{location}]")
+        if isinstance(step, BranchStep) and step.options:
+            options = ", ".join(
+                f"{opt.name} -> {opt.location}" for opt in step.options
+            )
+            print(f"    options: {options}")
 
 
 def facts_to_dict(facts) -> Dict[str, Any]:
@@ -239,6 +361,61 @@ def analysis_to_dict(analysis: RepoAnalysis) -> Dict[str, Any]:
     }
 
 
+def walkthrough_to_dict(walkthrough: Walkthrough) -> Dict[str, Any]:
+    def step_to_dict(step) -> Dict[str, Any]:
+        payload = {
+            "type": step.type.value,
+            "title": step.title,
+            "location": step.location,
+            "explanation": step.explanation,
+        }
+        if isinstance(step, OverviewStep):
+            payload["key_concepts"] = step.key_concepts
+        if isinstance(step, SurfaceStep):
+            payload["surface_kind"] = step.surface_kind
+            payload["example_usage"] = step.example_usage
+        if isinstance(step, TraceStep):
+            payload["calls_to"] = step.calls_to
+            payload["called_by"] = step.called_by
+        if isinstance(step, DataStep):
+            payload["fields"] = step.fields
+            payload["used_by"] = step.used_by
+        if isinstance(step, BoundaryStep):
+            payload["boundary_kind"] = step.boundary_kind
+            payload["can_continue"] = step.can_continue
+        if isinstance(step, BranchStep):
+            payload["options"] = [
+                {
+                    "name": opt.name,
+                    "description": opt.description,
+                    "location": opt.location,
+                }
+                for opt in step.options
+            ]
+            payload["default_option"] = step.default_option
+        if isinstance(step, RecapStep):
+            payload["summary"] = step.summary
+            payload["mental_model"] = step.mental_model
+            payload["next_steps"] = step.next_steps
+        return payload
+
+    return {
+        "title": walkthrough.title,
+        "goal": walkthrough.goal,
+        "surface": walkthrough.surface,
+        "chapters": [
+            {
+                "title": chapter.title,
+                "description": chapter.description,
+                "steps": [step_to_dict(step) for step in chapter.steps],
+            }
+            for chapter in walkthrough.chapters
+        ],
+        "has_more": walkthrough.has_more,
+        "continuation_context": walkthrough.continuation_context,
+    }
+
+
 def entry_point_to_dict(entry: EntryPoint) -> Dict[str, Any]:
     return {
         "path": entry.path,
@@ -246,6 +423,25 @@ def entry_point_to_dict(entry: EntryPoint) -> Dict[str, Any]:
         "description": entry.description,
         "why": entry.why,
     }
+
+
+def select_surface(surfaces: list[Surface], selector: str) -> Surface:
+    if selector.isdigit():
+        index = int(selector)
+        if index < 0 or index >= len(surfaces):
+            raise ValueError("Surface index out of range")
+        return surfaces[index]
+
+    needle = selector.strip().lower()
+    for surface in surfaces:
+        if needle == surface.name.lower():
+            return surface
+        if needle == surface.kind.value.lower():
+            return surface
+        if needle == surface.kind.name.lower():
+            return surface
+
+    raise ValueError("Surface not found. Use --list-surfaces to see options.")
 
 
 if __name__ == "__main__":

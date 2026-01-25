@@ -1,1 +1,1 @@
-"""RepoWalk package."""
+__all__ = ["repo_scout"]

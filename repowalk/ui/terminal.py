@@ -8,6 +8,11 @@ import textwrap
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
+from pygments import lex
+from pygments.lexers import TextLexer, get_lexer_for_filename
+from pygments.token import Token
+from pygments.util import ClassNotFound
+
 from ..repo_scout.agent import CodeWalkerAgent
 from ..tui import WalkSession, UIStep
 
@@ -16,6 +21,10 @@ COLOR_BORDER = 2
 COLOR_TITLE = 3
 COLOR_FOCUS = 4
 COLOR_DIM = 5
+COLOR_SYNTAX_KEYWORD = 6
+COLOR_SYNTAX_STRING = 7
+COLOR_SYNTAX_COMMENT = 8
+COLOR_SYNTAX_NUMBER = 9
 
 
 @dataclass
@@ -41,6 +50,7 @@ class UIState:
     code_scroll: int = 0
     code_cursor: int = 0
     explain_scroll: int = 0
+    code_cache: dict = field(default_factory=dict)
     overlay_title: Optional[str] = None
     overlay_lines: List[str] = field(default_factory=list)
     overlay_scroll: int = 0
@@ -118,6 +128,10 @@ def _init_colors() -> None:
     curses.init_pair(COLOR_TITLE, curses.COLOR_YELLOW, -1)
     curses.init_pair(COLOR_FOCUS, curses.COLOR_CYAN, -1)
     curses.init_pair(COLOR_DIM, curses.COLOR_WHITE, -1)
+    curses.init_pair(COLOR_SYNTAX_KEYWORD, curses.COLOR_CYAN, -1)
+    curses.init_pair(COLOR_SYNTAX_STRING, curses.COLOR_YELLOW, -1)
+    curses.init_pair(COLOR_SYNTAX_COMMENT, curses.COLOR_BLUE, -1)
+    curses.init_pair(COLOR_SYNTAX_NUMBER, curses.COLOR_MAGENTA, -1)
 
 
 def _render_screen(stdscr, state: UIState, height: int, width: int) -> None:
@@ -220,7 +234,7 @@ def _render_code_panel(
         title=step.title,
         focused=state.focus == "code",
     )
-    code_lines = step.code.splitlines() or ["(no code)"]
+    code_lines, line_segments = _get_code_render(state, step)
     visible_h = max(1, height - 2)
     _clamp_code_scroll(state, len(code_lines), visible_h)
 
@@ -229,16 +243,20 @@ def _render_code_panel(
     for row, idx in enumerate(range(line_start, line_end)):
         line_no = step.start_line + idx
         prefix = f"{line_no:4d} | "
-        text = prefix + code_lines[idx]
-        attr = curses.A_REVERSE if idx == state.code_cursor else curses.A_NORMAL
+        segments = line_segments[idx] if idx < len(line_segments) else []
+        if not segments:
+            segments = [(code_lines[idx], curses.A_NORMAL)]
+        rendered_segments = [(prefix, curses.A_DIM)] + segments
+        line_attr = curses.A_REVERSE if idx == state.code_cursor else curses.A_NORMAL
         if state.focus == "code" and idx == state.code_cursor:
-            attr |= curses.A_BOLD
-        _safe_addstr(
+            line_attr |= curses.A_BOLD
+        _render_segments(
             stdscr,
             y + 1 + row,
             x + 1,
-            _truncate(text, width - 2),
-            attr,
+            rendered_segments,
+            width - 2,
+            line_attr,
         )
 
 
@@ -263,11 +281,13 @@ def _render_explanation_panel(
     line_start = state.explain_scroll
     line_end = min(len(lines), line_start + visible_h)
     for row, idx in enumerate(range(line_start, line_end)):
+        text, attr = lines[idx]
         _safe_addstr(
             stdscr,
             y + 1 + row,
             x + 1,
-            _truncate(lines[idx], width - 2),
+            _truncate(text, width - 2),
+            attr,
         )
 
 
@@ -643,51 +663,138 @@ def _parse_definition_results(symbol: str, output: str) -> List[SearchResult]:
     return results
 
 
-def _format_explanation(step: UIStep, width: int) -> List[str]:
+def _format_explanation(step: UIStep, width: int) -> List[Tuple[str, int]]:
     sections = [
-        step.title,
+        f"# {step.title}",
         "",
         step.explanation or "(no explanation available)",
         "",
-        f"Key Concepts: {', '.join(step.key_concepts) if step.key_concepts else 'None'}",
-        f"Calls: {', '.join(step.calls) if step.calls else 'None'}",
+        f"**Key Concepts:** {', '.join(step.key_concepts) if step.key_concepts else 'None'}",
+        f"**Calls:** {', '.join(step.calls) if step.calls else 'None'}",
     ]
     raw = "\n".join(sections)
-    lines: List[str] = []
+    lines: List[Tuple[str, int]] = []
     in_code_block = False
+    code_attr = curses.A_DIM
+    heading_attr = curses.color_pair(COLOR_TITLE) | curses.A_BOLD
+    normal_attr = curses.A_NORMAL
+
     for raw_line in raw.splitlines():
         line = raw_line.rstrip()
         stripped = line.strip()
         if stripped.startswith("```"):
-            lines.append(line)
             in_code_block = not in_code_block
             continue
         if in_code_block:
-            lines.append(line)
+            lines.append((line, code_attr))
             continue
         if not stripped:
-            lines.append("")
+            lines.append(("", normal_attr))
             continue
-        if line.lstrip().startswith("#"):
-            wrapped = textwrap.wrap(line, width=width)
-            lines.extend(wrapped if wrapped else [line])
+        heading_match = re.match(r"^(#{1,6})\s+(.*)$", line.lstrip())
+        if heading_match:
+            text = _strip_inline_markdown(heading_match.group(2))
+            wrapped = textwrap.wrap(text, width=width)
+            for item in wrapped if wrapped else [text]:
+                lines.append((item, heading_attr))
             continue
         list_match = re.match(r"^(\s*(?:[-*+]|\d+\.)\s+)(.*)$", line)
         if list_match:
             prefix = list_match.group(1)
-            body = list_match.group(2)
+            body = _strip_inline_markdown(list_match.group(2))
             wrap_width = max(10, width - len(prefix))
             wrapped = textwrap.wrap(body, width=wrap_width)
             if not wrapped:
-                lines.append(prefix.rstrip())
+                lines.append((prefix.rstrip(), normal_attr))
             else:
-                lines.append(prefix + wrapped[0])
+                lines.append((prefix + wrapped[0], normal_attr))
                 for cont in wrapped[1:]:
-                    lines.append(" " * len(prefix) + cont)
+                    lines.append((" " * len(prefix) + cont, normal_attr))
             continue
-        wrapped = textwrap.wrap(line, width=width)
-        lines.extend(wrapped if wrapped else [line])
+        text = _strip_inline_markdown(line)
+        wrapped = textwrap.wrap(text, width=width)
+        for item in wrapped if wrapped else [text]:
+            lines.append((item, normal_attr))
     return lines
+
+
+def _get_code_render(
+    state: UIState, step: UIStep
+) -> Tuple[List[str], List[List[Tuple[str, int]]]]:
+    cache_key = state.session.current_step
+    cached = state.code_cache.get(cache_key)
+    if cached:
+        return cached
+
+    code_text = step.code.replace("\t", "    ")
+    code_lines = code_text.splitlines() or ["(no code)"]
+    line_segments = _lex_code_lines(code_text, step.file_path)
+
+    if len(line_segments) < len(code_lines):
+        line_segments.extend([[] for _ in range(len(code_lines) - len(line_segments))])
+
+    state.code_cache[cache_key] = (code_lines, line_segments)
+    return code_lines, line_segments
+
+
+def _lex_code_lines(code: str, file_path: str) -> List[List[Tuple[str, int]]]:
+    lexer = _get_lexer(file_path)
+    tokens = lex(code, lexer)
+    lines: List[List[Tuple[str, int]]] = [[]]
+    for ttype, value in tokens:
+        attr = _token_attr(ttype)
+        parts = value.split("\n")
+        for idx, part in enumerate(parts):
+            if part:
+                lines[-1].append((part, attr))
+            if idx < len(parts) - 1:
+                lines.append([])
+    return lines
+
+
+def _get_lexer(file_path: str):
+    try:
+        return get_lexer_for_filename(file_path)
+    except ClassNotFound:
+        return TextLexer()
+
+
+def _token_attr(ttype) -> int:
+    if ttype in Token.Keyword:
+        return curses.color_pair(COLOR_SYNTAX_KEYWORD) | curses.A_BOLD
+    if ttype in Token.String:
+        return curses.color_pair(COLOR_SYNTAX_STRING)
+    if ttype in Token.Comment:
+        return curses.color_pair(COLOR_SYNTAX_COMMENT) | curses.A_DIM
+    if ttype in Token.Number:
+        return curses.color_pair(COLOR_SYNTAX_NUMBER)
+    return curses.A_NORMAL
+
+
+def _render_segments(
+    win, y: int, x: int, segments: List[Tuple[str, int]], max_width: int, extra_attr: int
+) -> None:
+    remaining = max_width
+    cursor_x = x
+    for text, attr in segments:
+        if remaining <= 0:
+            break
+        if not text:
+            continue
+        chunk = text if len(text) <= remaining else text[:remaining]
+        _safe_addstr(win, y, cursor_x, chunk, attr | extra_attr)
+        cursor_x += len(chunk)
+        remaining -= len(chunk)
+
+
+def _strip_inline_markdown(text: str) -> str:
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"__([^_]+)__", r"\1", text)
+    text = re.sub(r"\*([^*]+)\*", r"\1", text)
+    text = re.sub(r"_([^_]+)_", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    return text
 
 
 def _symbol_at_cursor(state: UIState) -> Optional[str]:

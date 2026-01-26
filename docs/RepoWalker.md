@@ -650,7 +650,7 @@ class CodeWalkerAgent:
         print("\n📂 EXPLORATION PHASE\n")
         self.state.phase = Phase.EXPLORE
         
-        max_iterations = 15
+        max_iterations = 25
         iteration = 0
         
         while iteration < max_iterations:

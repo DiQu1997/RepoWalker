@@ -65,6 +65,9 @@ Create a step-by-step walk-through plan. For each step:
 3. Identify any data structures that need explanation
 4. Explain how it connects to the next step
 
+Important: file_path must be a specific file (include extension). Do not return
+directories like "src" or "core"; pick the exact source file that contains the code.
+
 Respond with JSON:
 {{
     "title": "Walk-through title",

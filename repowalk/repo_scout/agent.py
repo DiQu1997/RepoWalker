@@ -706,7 +706,7 @@ class CodeWalkerAgent:
         self,
         repo_path: str,
         model: str = "gpt-5.2",
-        max_explore_iterations: int = 15,
+        max_explore_iterations: int = 25,
         verbose: bool = False,
         pause_between_steps: bool = True,
     ):
@@ -719,6 +719,10 @@ class CodeWalkerAgent:
         self.pause_between_steps = pause_between_steps
 
     def run(self, user_request: str) -> None:
+        self.prepare_plan(user_request)
+        self._walk_phase()
+
+    def prepare_plan(self, user_request: str) -> Optional[WalkPlan]:
         self.state = AgentState(
             user_request=user_request,
             repo_path=str(self.tools.repo_path),
@@ -727,7 +731,13 @@ class CodeWalkerAgent:
         print("=" * 60)
         self._explore_phase()
         self._plan_phase()
-        self._walk_phase()
+        return self.state.plan
+
+    def get_step_code(self, step: WalkStep) -> str:
+        return self._get_step_code(step)
+
+    def generate_step_explanation(self, step: WalkStep, code: str) -> str:
+        return self._generate_step_explanation(step, code)
 
     # ===== Phase 1: Explore =====
 
@@ -1005,6 +1015,29 @@ class CodeWalkerAgent:
             )
             file_path = resolved_path
 
+        if self._path_is_dir(file_path):
+            self._log_warning(
+                f"Step file_path '{file_path}' is a directory; attempting symbol-based resolution."
+            )
+            symbol = self._extract_symbol(step.function_or_section) if step.function_or_section else ""
+            if symbol:
+                match = self._find_definition_in_path(symbol, file_path)
+                if match:
+                    match_path, match_line = match
+                    self._log_debug(
+                        f"Resolved directory '{file_path}' using symbol '{symbol}' to '{match_path}'."
+                    )
+                    file_path = match_path
+                    start_line = start_line or match_line
+                else:
+                    self._log_warning(
+                        f"No definition match found for symbol '{symbol}' under '{file_path}'."
+                    )
+            else:
+                self._log_warning(
+                    f"No function_or_section provided for directory '{file_path}'."
+                )
+
         last_error: Optional[str] = None
         if step.function_or_section:
             symbol = self._extract_symbol(step.function_or_section)
@@ -1150,9 +1183,62 @@ class CodeWalkerAgent:
         self._log_debug(f"Multiple matches for '{basename}': {matches[:5]}")
         return None
 
+    def _find_definition_in_path(
+        self, symbol: str, search_path: str
+    ) -> Optional[tuple[str, int]]:
+        patterns = self._definition_patterns(symbol)
+        for pattern in patterns:
+            result = self.tools.grep(
+                pattern, path=search_path, context_lines=0, ignore_case=False
+            )
+            if not result.success or result.output in ("(no matches)", "(empty output)", ""):
+                continue
+            match = self._parse_grep_first_match(result.output)
+            if match:
+                return match
+        return None
+
+    def _definition_patterns(self, symbol: str) -> List[str]:
+        sym = re.escape(symbol)
+        return [
+            rf"\bdef\s+{sym}\s*\(",
+            rf"\bclass\s+{sym}\b",
+            rf"^{sym}\s*=",
+            rf"\bfunc\s+{sym}\s*\(",
+            rf"\bfunc\s+\([^)]+\)\s+{sym}\s*\(",
+            rf"\btype\s+{sym}\b",
+            rf"\bfn\s+{sym}\s*\(",
+            rf"\bstruct\s+{sym}\b",
+            rf"\benum\s+{sym}\b",
+            rf"\bimpl\s+{sym}\b",
+            rf"\bfunction\s+{sym}\s*\(",
+            rf"\bconst\s+{sym}\s*=",
+            rf"\binterface\s+{sym}\b",
+        ]
+
+    def _parse_grep_first_match(self, output: str) -> Optional[tuple[str, int]]:
+        for line in output.splitlines():
+            if not line or line.startswith("--"):
+                continue
+            match = re.match(r"^(.*?):(\d+):", line)
+            if match:
+                path = match.group(1)
+                try:
+                    line_number = int(match.group(2))
+                except ValueError:
+                    continue
+                return path, line_number
+        return None
+
     def _log_debug(self, message: str) -> None:
         if self.verbose:
             print(f"[debug] {message}")
 
     def _log_warning(self, message: str) -> None:
         print(f"[warn] {message}")
+
+    def _path_is_dir(self, path: str) -> bool:
+        try:
+            return self.tools._resolve_path(path).is_dir()
+        except Exception:
+            return False

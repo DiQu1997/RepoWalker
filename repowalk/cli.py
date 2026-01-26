@@ -16,7 +16,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--max-explore-iterations",
         type=int,
-        default=15,
+        default=25,
         help="Maximum exploration steps before planning",
     )
     parser.add_argument(
@@ -30,6 +30,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Do not pause between walk-through steps",
     )
+    parser.add_argument(
+        "--tui",
+        action="store_true",
+        help="Run the terminal UI",
+    )
 
     args = parser.parse_args(argv)
 
@@ -41,7 +46,14 @@ def main(argv: list[str] | None = None) -> int:
             verbose=args.verbose,
             pause_between_steps=not args.no_pause,
         )
-        agent.run(args.request)
+        if args.tui:
+            from .tui import build_session
+            from .ui.terminal import start_terminal_ui
+
+            session = build_session(agent, args.request)
+            start_terminal_ui(session, agent, debug=args.verbose)
+        else:
+            agent.run(args.request)
         return 0
     except KeyboardInterrupt:
         print("\nInterrupted.")

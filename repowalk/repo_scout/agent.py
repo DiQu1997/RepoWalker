@@ -69,6 +69,7 @@ class ExplorationContext:
     entry_points: List[Dict] = field(default_factory=list)
     relevant_searches: List[Dict] = field(default_factory=list)
     data_structures_found: List[Dict] = field(default_factory=list)
+    outlines: List[Dict] = field(default_factory=list)
 
 
 @dataclass
@@ -749,6 +750,13 @@ class CodeWalkerAgent:
             iteration += 1
             print(f"--- Thinking (iteration {iteration}) ---")
             action = self._get_next_exploration_action()
+            if self._is_redundant_action(action):
+                warning = self._build_repeat_warning(action)
+                self._log_warning(warning)
+                action = self._get_next_exploration_action(repeat_warning=warning)
+                if self._is_redundant_action(action):
+                    print("\nExploration stalled (repeating tool). Proceeding to plan.\n")
+                    return
             if action.get("type") == "done":
                 print("\nExploration complete. Ready to plan.\n")
                 return
@@ -760,12 +768,13 @@ class CodeWalkerAgent:
             self._update_exploration_context(action, result)
         print("\nMax iterations reached. Proceeding with available info.\n")
 
-    def _get_next_exploration_action(self) -> Dict:
+    def _get_next_exploration_action(self, repeat_warning: str | None = None) -> Dict:
         prompt = build_exploration_prompt(
             user_request=self.state.user_request,
             repo_path=self.state.repo_path,
             exploration_context=self._format_exploration_context(),
             tool_descriptions=self.TOOL_DESCRIPTIONS,
+            repeat_warning=repeat_warning,
         )
         messages = [
             {
@@ -848,6 +857,13 @@ class CodeWalkerAgent:
                     "content": result.output,
                 }
             )
+        elif tool == "get_outline":
+            ctx.outlines.append(
+                {
+                    "file": action.get("args", {}).get("file_path"),
+                    "outline": result.output[:2000],
+                }
+            )
 
     def _format_exploration_context(self) -> str:
         ctx = self.state.exploration
@@ -878,14 +894,26 @@ class CodeWalkerAgent:
                 [f"- {d['name']} in {d['file']}" for d in ctx.data_structures_found]
             )
             parts.append(f"### Data Structures Found\n{ds_text}")
+        if ctx.outlines:
+            outline_text = "\n".join(
+                [f"- {o['file']}" for o in ctx.outlines[-5:]]
+            )
+            parts.append(f"### Outlines Captured\n{outline_text}")
         if self.state.tool_calls:
             calls_text = "\n".join(
                 [
-                    f"- {c['tool']}({list(c['args'].keys())})"
+                    f"- {c['tool']}({c['args']})"
                     for c in self.state.tool_calls[-10:]
                 ]
             )
             parts.append(f"### Tool Call History\n{calls_text}")
+            outputs_text = "\n\n".join(
+                [
+                    f"### {c['tool']}({c['args']})\n```\n{(c.get('output') or '')[:1000]}\n```"
+                    for c in self.state.tool_calls[-3:]
+                ]
+            )
+            parts.append(f"### Recent Tool Outputs\n{outputs_text}")
         return "\n\n".join(parts) if parts else "(No exploration done yet)"
 
     # ===== Phase 2: Plan =====
@@ -1117,6 +1145,27 @@ class CodeWalkerAgent:
         if " " in cleaned:
             cleaned = cleaned.split()[-1].strip()
         return cleaned
+
+    def _is_redundant_action(self, action: Dict) -> bool:
+        if not action or action.get("type") != "tool":
+            return False
+        if not self.state.tool_calls:
+            return False
+        last = self.state.tool_calls[-1]
+        return action.get("tool") == last.get("tool") and action.get("args") == last.get(
+            "args"
+        )
+
+    def _build_repeat_warning(self, action: Dict) -> str:
+        if not self.state.tool_calls:
+            return "Avoid repeating the same tool."
+        last = self.state.tool_calls[-1]
+        tool = last.get("tool")
+        args = last.get("args")
+        return (
+            f"You just ran {tool} with {args}. Do not repeat it; choose a different "
+            "tool or respond with done."
+        )
 
     def _split_path_and_line_info(
         self, file_path: str

@@ -8,8 +8,12 @@ def build_exploration_prompt(
     repo_path: str,
     exploration_context: str,
     tool_descriptions: List[str],
+    repeat_warning: str | None = None,
 ) -> str:
     tools_text = "\n".join(tool_descriptions)
+    warning_text = ""
+    if repeat_warning:
+        warning_text = f"\n## Repeat Guard\n{repeat_warning}\n"
     return f"""You are exploring a codebase to understand: "{user_request}"
 
 ## What You've Learned So Far
@@ -18,6 +22,7 @@ Repository: {repo_path}
 
 {exploration_context}
 
+{warning_text}
 ## Available Tools
 
 {tools_text}
@@ -30,6 +35,9 @@ Think step by step:
 1. What do I still need to understand?
 2. What's the most valuable information to get next?
 3. Which tool will give me that information?
+
+Avoid repeating the same tool call with identical arguments. If you already used a tool
+and got its output, either pick a different tool or declare you're ready to plan.
 
 If you have enough information to create a walk-through plan (you know the entry point,
 the key code path, and relevant data structures), respond with:

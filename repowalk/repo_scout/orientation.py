@@ -113,17 +113,16 @@ def build_step_explanation_prompt(
 
 ## Code
 ```
-{code[:4000]}
+{code}
 ```
 
 ## Instructions
 
-Provide a clear, detailed explanation that:
-1. States what this code does at a high level (1-2 sentences)
-2. Walks through the key operations line by line
-3. Explains any non-obvious logic or algorithms
-4. Clarifies how data flows through this code
-5. Notes any important patterns or idioms used
+Provide a clear, detailed and focused explanation of this code block, emphasizing key logic and data structures.
+- **Focus on substance**: Explain the core business logic, algorithms, and data transformations. Avoid redundant descriptions of simple syntax or standard boilerplate.
+- **Highlight complexity**: Specifically address edge cases, error handling, or non-obvious implementation details that matter.
+- **Structure**: Use cohesive paragraphs for the narrative. **Only use bullet points when strictly necessary** (e.g., listing distinct conditions or side effects).
+- **Depth**: Provide enough detail to understand *how* and *why* the code works, but skip trivial "single-line small stuff" unless it impacts the broader flow.
 
-Be thorough but readable. Use bullet points sparingly.
+Your goal is to clarify the mechanism and intent of this step without over-explaining the obvious.
 Focus on building understanding, not just describing."""

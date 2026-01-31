@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 import fnmatch
 import json
@@ -130,6 +130,77 @@ class LLMClient:
             return response.output[0].content[0].text
         except Exception:
             return ""
+
+
+class LLMCallLogger:
+    def __init__(
+        self,
+        enabled: bool = False,
+        log_path: Optional[Path] = None,
+        session_id: Optional[str] = None,
+    ):
+        self.enabled = enabled
+        self.log_path = log_path
+        self.session_id = session_id or self._default_session_id()
+        self._call_index = 0
+
+    def log_call(
+        self,
+        *,
+        caller: str,
+        phase: Optional[str],
+        purpose: str,
+        model: str,
+        params: Dict[str, Any],
+        messages: List[Dict[str, str]],
+        response: str,
+        prompt_parts: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not self.enabled or not self.log_path:
+            return
+        self._call_index += 1
+        entry = {
+            "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "session_id": self.session_id,
+            "call_id": f"{self.session_id}:{self._call_index:04d}",
+            "caller": caller,
+            "phase": phase,
+            "purpose": purpose,
+            "model": model,
+            "params": params,
+            "messages": messages,
+            "response": response,
+            "prompt_parts": prompt_parts or {},
+            "metadata": metadata or {},
+            "transcript": self._render_transcript(messages, model, params, response),
+        }
+        try:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry))
+                handle.write("\n")
+        except Exception:
+            return
+
+    def _default_session_id(self) -> str:
+        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        return f"repowalk-{ts}-{os.getpid()}"
+
+    def _render_transcript(
+        self,
+        messages: List[Dict[str, str]],
+        model: str,
+        params: Dict[str, Any],
+        response: str,
+    ) -> str:
+        parts: List[str] = []
+        for message in messages:
+            role = (message.get("role") or "user").upper()
+            content = message.get("content", "")
+            parts.append(f"{role}: {content}")
+        parts.append(f"LLM({model}, {params}): {response}")
+        return "\n\n".join(parts)
 
 
 def _load_env_file(path: Path) -> None:
@@ -710,14 +781,18 @@ class CodeWalkerAgent:
         max_explore_iterations: int = 25,
         verbose: bool = False,
         pause_between_steps: bool = True,
+        llm_log: bool = False,
+        llm_log_path: Optional[str] = None,
+        client: Optional[LLMClient] = None,
     ):
         self.tools = CodeWalkerTools(repo_path)
-        self.client = LLMClient(model=model)
+        self.client = client or LLMClient(model=model)
         self.model = model
         self.state: Optional[AgentState] = None
         self.max_explore_iterations = max_explore_iterations
         self.verbose = verbose
         self.pause_between_steps = pause_between_steps
+        self.llm_logger = self._init_llm_logger(llm_log, llm_log_path)
 
     def run(self, user_request: str) -> None:
         self.prepare_plan(user_request)
@@ -739,6 +814,48 @@ class CodeWalkerAgent:
 
     def generate_step_explanation(self, step: WalkStep, code: str) -> str:
         return self._generate_step_explanation(step, code)
+
+    def _init_llm_logger(
+        self, enabled: bool, log_path: Optional[str]
+    ) -> LLMCallLogger:
+        if not enabled:
+            return LLMCallLogger(enabled=False, log_path=None)
+        resolved = self._resolve_llm_log_path(log_path)
+        return LLMCallLogger(enabled=True, log_path=resolved)
+
+    def _resolve_llm_log_path(self, log_path: Optional[str]) -> Path:
+        if log_path:
+            candidate = Path(log_path)
+            if not candidate.is_absolute():
+                candidate = Path.cwd() / candidate
+            return candidate
+        return Path.cwd() / "repowalk_llm_calls.jsonl"
+
+    def _call_llm(
+        self,
+        *,
+        messages: List[Dict[str, str]],
+        max_output_tokens: int,
+        caller: str,
+        purpose: str,
+        prompt_parts: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        response = self.client.generate(messages, max_output_tokens=max_output_tokens)
+        model = getattr(self.client, "model", self.model)
+        phase = self.state.phase.value if self.state else None
+        self.llm_logger.log_call(
+            caller=caller,
+            phase=phase,
+            purpose=purpose,
+            model=model,
+            params={"max_output_tokens": max_output_tokens},
+            messages=messages,
+            response=response,
+            prompt_parts=prompt_parts,
+            metadata=metadata,
+        )
+        return response
 
     # ===== Phase 1: Explore =====
 
@@ -769,10 +886,11 @@ class CodeWalkerAgent:
         print("\nMax iterations reached. Proceeding with available info.\n")
 
     def _get_next_exploration_action(self, repeat_warning: str | None = None) -> Dict:
+        exploration_context = self._format_exploration_context()
         prompt = build_exploration_prompt(
             user_request=self.state.user_request,
             repo_path=self.state.repo_path,
-            exploration_context=self._format_exploration_context(),
+            exploration_context=exploration_context,
             tool_descriptions=self.TOOL_DESCRIPTIONS,
             repeat_warning=repeat_warning,
         )
@@ -783,7 +901,22 @@ class CodeWalkerAgent:
             },
             {"role": "user", "content": prompt},
         ]
-        text = self.client.generate(messages, max_output_tokens=800).strip()
+        text = self._call_llm(
+            messages=messages,
+            max_output_tokens=800,
+            caller="_get_next_exploration_action",
+            purpose="exploration_action",
+            prompt_parts={
+                "prompt": prompt,
+                "context": {
+                    "user_request": self.state.user_request,
+                    "repo_path": self.state.repo_path,
+                    "exploration_context": exploration_context,
+                    "tool_descriptions": self.TOOL_DESCRIPTIONS,
+                    "repeat_warning": repeat_warning,
+                },
+            },
+        ).strip()
         action = self._parse_json(text)
         if not action:
             print(f"Failed to parse: {text[:200]}")
@@ -812,15 +945,12 @@ class CodeWalkerAgent:
             return ToolResult(False, "", str(exc))
 
     def _record_tool_call(self, action: Dict, result: ToolResult) -> None:
-        output = result.output
-        if len(output) > 4000:
-            output = output[:4000] + "... (truncated)"
         self.state.tool_calls.append(
             {
                 "tool": action.get("tool"),
                 "args": action.get("args", {}),
                 "success": result.success,
-                "output": output,
+                "output": result.output,
                 "error": result.error,
             }
         )
@@ -838,14 +968,14 @@ class CodeWalkerAgent:
                 ctx.readme_content = result.output
             elif any(x in path for x in ["config", "main", "app", "server"]):
                 ctx.key_files.append(
-                    {"path": action["args"]["path"], "preview": result.output[:500]}
+                    {"path": action["args"]["path"], "preview": result.output}
                 )
         elif tool in ["grep", "git_grep", "find_definition"]:
             ctx.relevant_searches.append(
                 {
                     "query": action.get("args", {}).get("pattern")
                     or action.get("args", {}).get("symbol"),
-                    "results": result.output[:1000],
+                    "results": result.output,
                 }
             )
         elif tool in ["get_class", "get_function"]:
@@ -861,7 +991,7 @@ class CodeWalkerAgent:
             ctx.outlines.append(
                 {
                     "file": action.get("args", {}).get("file_path"),
-                    "outline": result.output[:2000],
+                    "outline": result.output,
                 }
             )
 
@@ -870,13 +1000,11 @@ class CodeWalkerAgent:
         parts: List[str] = []
         if ctx.repo_structure:
             parts.append(
-                "### Directory Structure\n```\n"
-                + ctx.repo_structure[:2000]
-                + "\n```"
+                "### Directory Structure\n```\n" + ctx.repo_structure + "\n```"
             )
         if ctx.readme_content:
             parts.append(
-                "### README\n```\n" + ctx.readme_content[:2000] + "\n```"
+                "### README\n```\n" + ctx.readme_content + "\n```"
             )
         if ctx.key_files:
             files_text = "\n".join([f"- {f['path']}" for f in ctx.key_files])
@@ -909,7 +1037,7 @@ class CodeWalkerAgent:
             parts.append(f"### Tool Call History\n{calls_text}")
             outputs_text = "\n\n".join(
                 [
-                    f"### {c['tool']}({c['args']})\n```\n{(c.get('output') or '')[:1000]}\n```"
+                    f"### {c['tool']}({c['args']})\n```\n{(c.get('output') or '')}\n```"
                     for c in self.state.tool_calls[-3:]
                 ]
             )
@@ -921,10 +1049,12 @@ class CodeWalkerAgent:
     def _plan_phase(self) -> None:
         print("\nPLANNING PHASE\n")
         self.state.phase = Phase.PLAN
+        exploration_context = self._format_exploration_context()
+        full_tool_results = self._format_full_tool_results()
         prompt = build_plan_prompt(
             user_request=self.state.user_request,
-            exploration_context=self._format_exploration_context(),
-            full_tool_results=self._format_full_tool_results(),
+            exploration_context=exploration_context,
+            full_tool_results=full_tool_results,
         )
         messages = [
             {
@@ -933,7 +1063,20 @@ class CodeWalkerAgent:
             },
             {"role": "user", "content": prompt},
         ]
-        text = self.client.generate(messages, max_output_tokens=2500).strip()
+        text = self._call_llm(
+            messages=messages,
+            max_output_tokens=2500,
+            caller="_plan_phase",
+            purpose="plan",
+            prompt_parts={
+                "prompt": prompt,
+                "context": {
+                    "user_request": self.state.user_request,
+                    "exploration_context": exploration_context,
+                    "full_tool_results": full_tool_results,
+                },
+            },
+        ).strip()
         plan_data = self._parse_json(text)
         if not plan_data:
             print("Failed to parse plan.")
@@ -1103,7 +1246,24 @@ class CodeWalkerAgent:
             code=code,
         )
         messages = [{"role": "user", "content": prompt}]
-        return self.client.generate(messages, max_output_tokens=1500)
+        return self._call_llm(
+            messages=messages,
+            max_output_tokens=1500,
+            caller="_generate_step_explanation",
+            purpose="step_explanation",
+            prompt_parts={
+                "prompt": prompt,
+                "context": {
+                    "user_request": self.state.user_request,
+                    "step_data": {
+                        "title": step.title,
+                        "why_important": step.why_important,
+                        "key_concepts": step.key_concepts,
+                    },
+                    "code": code,
+                },
+            },
+        )
 
     # ===== Parsing Helpers =====
 

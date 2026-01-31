@@ -35,6 +35,16 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Run the terminal UI",
     )
+    parser.add_argument(
+        "--llm-log",
+        action="store_true",
+        help="Write full LLM request/response logs to a JSONL file",
+    )
+    parser.add_argument(
+        "--llm-log-path",
+        default=None,
+        help="Path for LLM logs (default: ./repowalk_llm_calls.jsonl)",
+    )
 
     args = parser.parse_args(argv)
 
@@ -45,6 +55,8 @@ def main(argv: list[str] | None = None) -> int:
             max_explore_iterations=args.max_explore_iterations,
             verbose=args.verbose,
             pause_between_steps=not args.no_pause,
+            llm_log=args.llm_log,
+            llm_log_path=args.llm_log_path,
         )
         if args.tui:
             from .tui import build_session

@@ -46,6 +46,9 @@ class WalkSession:
     title: str
     overview: str
     steps: List[UIStep]
+    overview_summary: str = ""
+    overview_flow: str = ""
+    overview_data_flow: List[str] = field(default_factory=list)
     current_step: int = 0
     dive_stack: List[Tuple[int, int, int, int]] = field(default_factory=list)
 
@@ -95,7 +98,21 @@ def build_session(agent: CodeWalkerAgent, user_request: str) -> WalkSession:
             )
         )
 
-    return WalkSession(title=plan.title, overview=plan.overview, steps=steps)
+    overview_summary = ""
+    overview_flow = ""
+    overview_data_flow: List[str] = []
+    if agent.state:
+        overview_summary = agent.state.overview_summary or ""
+        overview_flow = agent.state.overview_flow or ""
+        overview_data_flow = list(agent.state.overview_data_flow or [])
+    return WalkSession(
+        title=plan.title,
+        overview=plan.overview,
+        steps=steps,
+        overview_summary=overview_summary,
+        overview_flow=overview_flow,
+        overview_data_flow=overview_data_flow,
+    )
 
 
 def run_tui(session: WalkSession, agent: CodeWalkerAgent, debug: bool = False) -> None:
@@ -454,10 +471,18 @@ class CodeWalkerTUI:
         return Panel(shortcuts, style="dim")
 
     def _render_overview(self, height: int, width: int) -> Panel:
-        names = [step.title.split(":")[-1].strip() for step in self.session.steps]
-        path_text = " -> ".join(names)
-        wrapped = textwrap.wrap(path_text, width=max(20, width - 6))
-        text = Text("\n".join(wrapped))
+        content_width = max(20, width - 6)
+        lines = self._format_overview_lines(content_width)
+        visible_height = max(3, height - 2)
+        visible_lines = lines[:visible_height]
+        text = Text()
+        for idx, line in enumerate(visible_lines):
+            if idx:
+                text.append("\n")
+            if isinstance(line, Text):
+                text.append_text(line)
+            else:
+                text.append(str(line))
         return Panel(text, title="Overview", border_style="magenta", height=height)
 
     def _render_overlay(self, height: int, width: int) -> Panel:
@@ -759,6 +784,9 @@ class CodeWalkerTUI:
         data = {
             "title": self.session.title,
             "overview": self.session.overview,
+            "overview_summary": self.session.overview_summary,
+            "overview_flow": self.session.overview_flow,
+            "overview_data_flow": self.session.overview_data_flow,
             "steps": [asdict(step) for step in self.session.steps],
         }
         path.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -766,7 +794,23 @@ class CodeWalkerTUI:
 
     def _export_markdown(self) -> None:
         path = Path.cwd() / "repowalk_session.md"
-        lines = [f"# {self.session.title}", "", self.session.overview, ""]
+        lines = [f"# {self.session.title}", ""]
+        overview_text = (
+            self.session.overview_summary or self.session.overview or ""
+        )
+        if overview_text:
+            lines.extend([overview_text, ""])
+        if self.session.overview_data_flow:
+            lines.append("Data Flow:")
+            for item in self.session.overview_data_flow:
+                lines.append(f"- {item}")
+            lines.append("")
+        if self.session.overview_flow:
+            lines.append("Flow:")
+            lines.append("```")
+            lines.append(self.session.overview_flow)
+            lines.append("```")
+            lines.append("")
         for step in self.session.steps:
             lines.append(f"## Step {step.step_number}: {step.title}")
             lines.append(f"File: {step.file_path}")
@@ -829,6 +873,44 @@ class CodeWalkerTUI:
                 lines.append(Text(""))
                 continue
             segments = [(seg.text, seg.style) for seg in line if isinstance(seg, Segment)]
+            if not segments:
+                lines.append(Text(""))
+                continue
+            lines.append(Text.assemble(*segments))
+        return lines
+
+    def _format_overview_lines(self, width: int) -> List[Text]:
+        summary = self.session.overview_summary or self.session.overview or ""
+        content = [f"# {self.session.title}", ""]
+        if summary:
+            content.extend([summary, ""])
+        if self.session.overview_data_flow:
+            content.append("**Data Flow:**")
+            for item in self.session.overview_data_flow:
+                content.append(f"- {item}")
+            content.append("")
+        if self.session.overview_flow:
+            content.extend(["**Flow:**", "```", self.session.overview_flow, "```", ""])
+        if self.session.steps:
+            content.append("**Steps:**")
+            for step in self.session.steps:
+                file_name = Path(step.file_path).name if step.file_path else "unknown"
+                content.append(f"- {step.step_number}. {step.title} ({file_name})")
+        markdown = Markdown("\n".join(content))
+        render_console = Console(
+            width=width,
+            color_system=self.console.color_system,
+            force_terminal=True,
+        )
+        rendered_lines = render_console.render_lines(markdown)
+        lines: List[Text] = []
+        for line in rendered_lines:
+            if not line:
+                lines.append(Text(""))
+                continue
+            segments = [
+                (seg.text, seg.style) for seg in line if isinstance(seg, Segment)
+            ]
             if not segments:
                 lines.append(Text(""))
                 continue

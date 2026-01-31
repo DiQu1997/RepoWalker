@@ -20,6 +20,7 @@ except ImportError:  # pragma: no cover - handled at runtime
 
 from .orientation import (
     build_exploration_prompt,
+    build_overview_flow_prompt,
     build_plan_prompt,
     build_step_flow_prompt,
     build_step_explanation_prompt,
@@ -83,6 +84,9 @@ class AgentState:
     current_step: int = 0
     thinking_history: List[Dict] = field(default_factory=list)
     tool_calls: List[Dict] = field(default_factory=list)
+    overview_flow: Optional[str] = None
+    overview_summary: Optional[str] = None
+    overview_data_flow: List[str] = field(default_factory=list)
 
 
 class LLMClient:
@@ -1112,6 +1116,9 @@ class CodeWalkerAgent:
             steps=steps,
             total_steps=len(steps),
         )
+        self._initialize_overview()
+        if self.flow_diagrams:
+            self._generate_overview_flow()
         print(f"{self.state.plan.title}")
         print(f"  {self.state.plan.overview}")
         print(f"  ({self.state.plan.total_steps} steps)")
@@ -1125,6 +1132,81 @@ class CodeWalkerAgent:
             )
         return "\n\n".join(parts) if parts else "(no tool results)"
 
+    def _initialize_overview(self) -> None:
+        if not self.state or not self.state.plan:
+            return
+        self.state.overview_summary = self.state.plan.overview
+        self.state.overview_flow = self._build_linear_overview_flow(self.state.plan)
+        self.state.overview_data_flow = []
+
+    def _build_linear_overview_flow(self, plan: WalkPlan) -> str:
+        labels = [self._format_overview_node(step) for step in plan.steps]
+        return " -> ".join(labels) if labels else ""
+
+    def _format_overview_node(self, step: WalkStep) -> str:
+        title = step.title.strip() or "Step"
+        file_name = Path(step.file_path).name if step.file_path else "unknown"
+        label = f"{step.step_number}: {title} ({file_name})"
+        if len(label) > 88:
+            trimmed_title = title[:40].rstrip()
+            label = f"{step.step_number}: {trimmed_title}... ({file_name})"
+        return label
+
+    def _generate_overview_flow(self) -> None:
+        if not self.state or not self.state.plan:
+            return
+        steps = [
+            {
+                "step_number": step.step_number,
+                "title": step.title,
+                "file_path": step.file_path,
+                "function_or_section": step.function_or_section,
+                "leads_to": step.leads_to,
+                "key_concepts": step.key_concepts,
+            }
+            for step in self.state.plan.steps
+        ]
+        prompt = build_overview_flow_prompt(
+            user_request=self.state.user_request,
+            plan_overview=self.state.plan.overview,
+            steps=steps,
+        )
+        messages = [
+            {
+                "role": "system",
+                "content": "Return only valid JSON. No prose.",
+            },
+            {"role": "user", "content": prompt},
+        ]
+        text = self._call_llm(
+            messages=messages,
+            max_output_tokens=1200,
+            caller="_generate_overview_flow",
+            purpose="overview_flow",
+            prompt_parts={
+                "prompt": prompt,
+                "context": {
+                    "user_request": self.state.user_request,
+                    "plan_overview": self.state.plan.overview,
+                    "steps": steps,
+                },
+            },
+        ).strip()
+        data = self._parse_json(text)
+        if not data:
+            return
+        flow = data.get("flow")
+        summary = data.get("summary")
+        data_flow = data.get("data_flow")
+        if isinstance(flow, str) and flow.strip():
+            self.state.overview_flow = flow.strip()
+        if isinstance(summary, str) and summary.strip():
+            self.state.overview_summary = summary.strip()
+        if isinstance(data_flow, list):
+            self.state.overview_data_flow = [
+                str(item) for item in data_flow if str(item).strip()
+            ]
+
     # ===== Phase 3: Walk =====
 
     def _walk_phase(self) -> None:
@@ -1137,6 +1219,7 @@ class CodeWalkerAgent:
         self.state.phase = Phase.WALK
         print(f"\n# {self.state.plan.title}\n")
         print(f"{self.state.plan.overview}\n")
+        self._print_overview()
         print("-" * 60)
         for index, step in enumerate(self.state.plan.steps):
             self.state.current_step = index + 1
@@ -1147,6 +1230,36 @@ class CodeWalkerAgent:
         print("Walk-through complete!")
         print("=" * 60)
         self.state.phase = Phase.COMPLETE
+
+    def _print_overview(self) -> None:
+        if not self.state:
+            return
+        overview_lines: List[str] = []
+        summary = self.state.overview_summary
+        data_flow = self.state.overview_data_flow or []
+        flow = self.state.overview_flow
+        if summary:
+            overview_lines.append(summary)
+        if data_flow:
+            overview_lines.append("\nData Flow")
+            for item in data_flow:
+                overview_lines.append(f"- {item}")
+        if flow:
+            overview_lines.append("\nFlow")
+            overview_lines.append("```")
+            overview_lines.append(flow)
+            overview_lines.append("```")
+        if self.state.plan and self.state.plan.steps:
+            overview_lines.append("\nSteps")
+            for step in self.state.plan.steps:
+                file_name = Path(step.file_path).name if step.file_path else "unknown"
+                overview_lines.append(
+                    f"- {step.step_number}. {step.title} ({file_name})"
+                )
+        if overview_lines:
+            print("\nOVERVIEW\n")
+            print("\n".join(overview_lines))
+            print("\n" + "-" * 60)
 
     def _present_step(self, step: WalkStep) -> None:
         print(f"\n## Step {step.step_number}: {step.title}")

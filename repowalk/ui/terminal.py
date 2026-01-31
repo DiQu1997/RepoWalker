@@ -344,13 +344,50 @@ def _render_overview(
 ) -> None:
     _draw_box(stdscr, y, 0, height, width, title="Overview")
     row = y + 1
-    for idx, step in enumerate(state.session.steps):
-        if row >= y + height - 1:
-            break
-        marker = ">" if idx == state.session.current_step else " "
-        line = f"{marker} {idx + 1}. {step.title}"
-        _safe_addstr(stdscr, row, 1, _truncate(line, width - 2))
+    max_row = y + height - 1
+    content_width = max(10, width - 2)
+
+    def add_wrapped(line: str, attr: int = curses.A_NORMAL) -> None:
+        nonlocal row
+        if row >= max_row:
+            return
+        wrapped = textwrap.wrap(line, width=content_width) or [line]
+        for item in wrapped:
+            if row >= max_row:
+                break
+            _safe_addstr(stdscr, row, 1, _truncate(item, content_width), attr)
+            row += 1
+
+    summary = state.session.overview_summary or state.session.overview or ""
+    if summary:
+        add_wrapped(summary)
         row += 1
+
+    if state.session.overview_data_flow:
+        add_wrapped("Data Flow:", curses.A_BOLD)
+        for item in state.session.overview_data_flow:
+            add_wrapped(f"- {item}")
+        row += 1
+
+    if state.session.overview_flow:
+        add_wrapped("Flow:", curses.A_BOLD)
+        for flow_line in state.session.overview_flow.splitlines():
+            if row >= max_row:
+                break
+            _safe_addstr(
+                stdscr, row, 1, _truncate(flow_line, content_width), curses.A_DIM
+            )
+            row += 1
+        row += 1
+
+    if row < max_row:
+        add_wrapped("Steps:", curses.A_BOLD)
+        for idx, step in enumerate(state.session.steps):
+            if row >= max_row:
+                break
+            marker = ">" if idx == state.session.current_step else " "
+            line = f"{marker} {idx + 1}. {step.title}"
+            add_wrapped(line)
 
 
 def _render_overlay(stdscr, state: UIState, height: int, width: int) -> None:

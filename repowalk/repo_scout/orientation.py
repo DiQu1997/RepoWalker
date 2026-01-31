@@ -148,8 +148,62 @@ def build_step_flow_prompt(
 ## Instructions
 
 Produce ONLY an ASCII flow diagram. No prose, no bullets, no markdown fences.
-- Use clear start/end nodes.
-- Show key calls, branches, and early exits.
+
+Diagram conventions:
+- Use plain text nodes (no bracketed tags like `[Start]`, `[End]`, `[return]`, `[error]`, `[action]`).
+- Use arrows to show order: `->` for forward flow.
+- Decision: use a node like `if <condition>` with branch lines prefixed `->` (no yes/no labels).
+- Loop: show a back-edge with `↺` or `<-` and a short loop condition.
+- Switch: use a node like `switch <expr>` with branch lines `-> <case>` (no `case`/`default` labels unless needed for clarity).
+
+Abstraction rules (important):
+- Aim for 3–7 main nodes max (excluding Start/End).
+- Group trivial steps (assignments, cache lookups, minor transforms) into one node.
+- Prefer intent labels: e.g., `[load config]`, `[validate input]`, `[resolve path]`.
+- Only show branches that change control flow or outcomes.
+- If there are many checks, group them based on their purpose like validate output format, validate user auth or so.
+
+Quality rules:
+- Show the *actual* control flow (major branches, early exits, error paths).
 - Keep width under 90 characters.
 - If flow is linear, show a simple chain.
-- If flow is unclear, show a high-level best-effort flow."""
+- If flow is unclear, produce a high-level best-effort flow rather than guessing details."""
+
+
+def build_overview_flow_prompt(
+    user_request: str,
+    plan_overview: str,
+    steps: List[Dict],
+) -> str:
+    steps_text = "\n".join(
+        [
+            f"{s.get('step_number')}. {s.get('title')} | {s.get('file_path')} | "
+            f"{s.get('function_or_section') or ''} | leads_to={s.get('leads_to') or ''}"
+            for s in steps
+        ]
+    )
+    return f"""Create a high-level overview of the entire code flow for:
+"{user_request}"
+
+## Plan Overview
+{plan_overview}
+
+## Steps (ordered)
+{steps_text}
+
+## Instructions
+
+Return ONLY JSON with this shape:
+{{
+  "flow": "ASCII flow diagram",
+  "summary": "2-4 sentence high-level explanation of the whole flow",
+  "data_flow": ["key data structure -> transformation", "…"]
+}}
+
+Flow guidelines:
+- Use plain text nodes (no bracketed tags).
+- Prefer labels like `step 1: ... (file)` for major calls/sections.
+- Show cross-file transitions and major call flow.
+- Use `if <condition>` for branching when steps imply it (no yes/no labels).
+- Keep width under 90 characters.
+- Prefer clarity over completeness; stick to provided steps."""

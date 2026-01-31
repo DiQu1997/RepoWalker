@@ -664,14 +664,17 @@ def _parse_definition_results(symbol: str, output: str) -> List[SearchResult]:
 
 
 def _format_explanation(step: UIStep, width: int) -> List[Tuple[str, int]]:
-    sections = [
-        f"# {step.title}",
-        "",
-        step.explanation or "(no explanation available)",
-        "",
-        f"**Key Concepts:** {', '.join(step.key_concepts) if step.key_concepts else 'None'}",
-        f"**Calls:** {', '.join(step.calls) if step.calls else 'None'}",
-    ]
+    sections = [f"# {step.title}", ""]
+    if step.flow:
+        sections.extend(["**Flow:**", "```", step.flow, "```", ""])
+    sections.extend(
+        [
+            step.explanation or "(no explanation available)",
+            "",
+            f"**Key Concepts:** {', '.join(step.key_concepts) if step.key_concepts else 'None'}",
+            f"**Calls:** {', '.join(step.calls) if step.calls else 'None'}",
+        ]
+    )
     raw = "\n".join(sections)
     lines: List[Tuple[str, int]] = []
     in_code_block = False

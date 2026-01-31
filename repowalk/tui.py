@@ -34,6 +34,7 @@ class UIStep:
     start_line: int
     code: str
     explanation: str
+    flow: Optional[str] = None
     data_structures: List[Dict[str, str]] = field(default_factory=list)
     key_concepts: List[str] = field(default_factory=list)
     calls: List[str] = field(default_factory=list)
@@ -74,6 +75,7 @@ def build_session(agent: CodeWalkerAgent, user_request: str) -> WalkSession:
         cleaned_code, inferred_start = _strip_line_numbers(code_with_numbers)
         start_line = step.start_line or hint_start or inferred_start or 1
         explanation = agent.generate_step_explanation(step, cleaned_code)
+        flow = agent.generate_step_flow(step, cleaned_code) if agent.flow_diagrams else ""
         data_structures = _resolve_data_structures(agent, step.data_structures)
         calls = _extract_calls(cleaned_code)
 
@@ -85,6 +87,7 @@ def build_session(agent: CodeWalkerAgent, user_request: str) -> WalkSession:
                 start_line=start_line,
                 code=cleaned_code,
                 explanation=explanation,
+                flow=flow,
                 data_structures=data_structures,
                 key_concepts=step.key_concepts,
                 calls=calls,
@@ -772,6 +775,12 @@ class CodeWalkerTUI:
             lines.append(step.code)
             lines.append("```")
             lines.append("")
+            if step.flow:
+                lines.append("Flow:")
+                lines.append("```")
+                lines.append(step.flow)
+                lines.append("```")
+                lines.append("")
             lines.append(step.explanation)
             lines.append("")
             if step.data_structures:
@@ -788,14 +797,25 @@ class CodeWalkerTUI:
         return self.session.steps[self.session.current_step]
 
     def _format_explanation_lines(self, step: UIStep, width: int) -> List[Text]:
-        content = [
-            f"## {step.title}",
-            "",
-            step.explanation or "(no explanation available)",
-            "",
-            f"**Key Concepts:** {', '.join(step.key_concepts) if step.key_concepts else 'None'}",
-            f"**Calls:** {', '.join(step.calls) if step.calls else 'None'}",
-        ]
+        content = [f"## {step.title}", ""]
+        if step.flow:
+            content.extend(
+                [
+                    "**Flow:**",
+                    "```",
+                    step.flow,
+                    "```",
+                    "",
+                ]
+            )
+        content.extend(
+            [
+                step.explanation or "(no explanation available)",
+                "",
+                f"**Key Concepts:** {', '.join(step.key_concepts) if step.key_concepts else 'None'}",
+                f"**Calls:** {', '.join(step.calls) if step.calls else 'None'}",
+            ]
+        )
         markdown = Markdown("\n".join(content))
         render_console = Console(
             width=width,

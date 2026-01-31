@@ -36,6 +36,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Run the terminal UI",
     )
     parser.add_argument(
+        "--flow",
+        action="store_true",
+        help="Generate ASCII flow diagrams for each step",
+    )
+    parser.add_argument(
         "--llm-log",
         action="store_true",
         help="Write full LLM request/response logs to a JSONL file",
@@ -55,6 +60,7 @@ def main(argv: list[str] | None = None) -> int:
             max_explore_iterations=args.max_explore_iterations,
             verbose=args.verbose,
             pause_between_steps=not args.no_pause,
+            flow_diagrams=args.flow,
             llm_log=args.llm_log,
             llm_log_path=args.llm_log_path,
         )

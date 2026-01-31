@@ -21,6 +21,7 @@ except ImportError:  # pragma: no cover - handled at runtime
 from .orientation import (
     build_exploration_prompt,
     build_plan_prompt,
+    build_step_flow_prompt,
     build_step_explanation_prompt,
 )
 
@@ -781,6 +782,7 @@ class CodeWalkerAgent:
         max_explore_iterations: int = 25,
         verbose: bool = False,
         pause_between_steps: bool = True,
+        flow_diagrams: bool = False,
         llm_log: bool = False,
         llm_log_path: Optional[str] = None,
         client: Optional[LLMClient] = None,
@@ -792,6 +794,7 @@ class CodeWalkerAgent:
         self.max_explore_iterations = max_explore_iterations
         self.verbose = verbose
         self.pause_between_steps = pause_between_steps
+        self.flow_diagrams = flow_diagrams
         self.llm_logger = self._init_llm_logger(llm_log, llm_log_path)
 
     def run(self, user_request: str) -> None:
@@ -811,6 +814,9 @@ class CodeWalkerAgent:
 
     def get_step_code(self, step: WalkStep) -> str:
         return self._get_step_code(step)
+
+    def generate_step_flow(self, step: WalkStep, code: str) -> str:
+        return self._generate_step_flow(step, code)
 
     def generate_step_explanation(self, step: WalkStep, code: str) -> str:
         return self._generate_step_explanation(step, code)
@@ -1151,6 +1157,13 @@ class CodeWalkerAgent:
         print(code)
 
         print("```")
+        if self.flow_diagrams:
+            flow = self._generate_step_flow(step, code)
+            if flow.strip():
+                print("\nFlow\n")
+                print("```")
+                print(flow)
+                print("```")
         if step.data_structures:
             print("\nKey Data Structures\n")
             for ds_name in step.data_structures:
@@ -1251,6 +1264,36 @@ class CodeWalkerAgent:
             max_output_tokens=1500,
             caller="_generate_step_explanation",
             purpose="step_explanation",
+            prompt_parts={
+                "prompt": prompt,
+                "context": {
+                    "user_request": self.state.user_request,
+                    "step_data": {
+                        "title": step.title,
+                        "why_important": step.why_important,
+                        "key_concepts": step.key_concepts,
+                    },
+                    "code": code,
+                },
+            },
+        )
+
+    def _generate_step_flow(self, step: WalkStep, code: str) -> str:
+        prompt = build_step_flow_prompt(
+            user_request=self.state.user_request,
+            step_data={
+                "title": step.title,
+                "why_important": step.why_important,
+                "key_concepts": step.key_concepts,
+            },
+            code=code,
+        )
+        messages = [{"role": "user", "content": prompt}]
+        return self._call_llm(
+            messages=messages,
+            max_output_tokens=800,
+            caller="_generate_step_flow",
+            purpose="step_flow",
             prompt_parts={
                 "prompt": prompt,
                 "context": {

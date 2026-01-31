@@ -126,3 +126,30 @@ Provide a clear, detailed and focused explanation of this code block, emphasizin
 
 Your goal is to clarify the mechanism and intent of this step without over-explaining the obvious.
 Focus on building understanding, not just describing."""
+
+
+def build_step_flow_prompt(
+    user_request: str,
+    step_data: Dict,
+    code: str,
+) -> str:
+    return f"""Create a concise ASCII flow diagram for this code step about "{user_request}".
+
+## Step Context
+- Title: {step_data.get("title", "")}
+- Why important: {step_data.get("why_important", "Part of main flow")}
+- Key concepts: {step_data.get("key_concepts", [])}
+
+## Code
+```
+{code}
+```
+
+## Instructions
+
+Produce ONLY an ASCII flow diagram. No prose, no bullets, no markdown fences.
+- Use clear start/end nodes.
+- Show key calls, branches, and early exits.
+- Keep width under 90 characters.
+- If flow is linear, show a simple chain.
+- If flow is unclear, show a high-level best-effort flow."""

@@ -1141,7 +1141,15 @@ class CodeWalkerAgent:
 
     def _build_linear_overview_flow(self, plan: WalkPlan) -> str:
         labels = [self._format_overview_node(step) for step in plan.steps]
-        return " -> ".join(labels) if labels else ""
+        if not labels:
+            return ""
+        lines: List[str] = []
+        for index, label in enumerate(labels):
+            lines.extend(self._box_text(label))
+            if index < len(labels) - 1:
+                lines.append("  |")
+                lines.append("  v")
+        return "\n".join(lines)
 
     def _format_overview_node(self, step: WalkStep) -> str:
         title = step.title.strip() or "Step"
@@ -1151,6 +1159,16 @@ class CodeWalkerAgent:
             trimmed_title = title[:40].rstrip()
             label = f"{step.step_number}: {trimmed_title}... ({file_name})"
         return label
+
+    def _box_text(self, text: str, max_width: int = 90) -> List[str]:
+        max_inner = max(10, max_width - 4)
+        cleaned = text.replace("\n", " ").strip()
+        if len(cleaned) > max_inner:
+            cleaned = cleaned[: max_inner - 3].rstrip() + "..."
+        inner_width = max(3, len(cleaned))
+        top = "+" + "-" * (inner_width + 2) + "+"
+        middle = "| " + cleaned.ljust(inner_width) + " |"
+        return [top, middle, top]
 
     def _generate_overview_flow(self) -> None:
         if not self.state or not self.state.plan:

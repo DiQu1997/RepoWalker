@@ -150,11 +150,15 @@ def build_step_flow_prompt(
 Produce ONLY an ASCII flow diagram. No prose, no bullets, no markdown fences.
 
 Diagram conventions:
-- Use plain text nodes (no bracketed tags like `[Start]`, `[End]`, `[return]`, `[error]`, `[action]`).
-- Use arrows to show order: `->` for forward flow.
-- Decision: use a node like `if <condition>` with branch lines prefixed `->` (no yes/no labels).
+- Use ASCII boxes for nodes:
+  +---------+
+  | text    |
+  +---------+
+- No bracketed tags like `[Start]`, `[End]`, `[return]`, `[error]`, `[action]`.
+- Use arrows to show order: `->` for forward flow or vertical connectors with `|` and `v`.
+- Decision: use a box like `if <condition>` with branch lines prefixed `->` (no yes/no labels).
 - Loop: show a back-edge with `↺` or `<-` and a short loop condition.
-- Switch: use a node like `switch <expr>` with branch lines `-> <case>` (no `case`/`default` labels unless needed for clarity).
+- Switch: use a box like `switch <expr>` with branch lines `-> <case>` (no `case`/`default` labels unless needed for clarity).
 
 Abstraction rules (important):
 - Aim for 3–7 main nodes max (excluding Start/End).
@@ -201,8 +205,8 @@ Return ONLY JSON with this shape:
 }}
 
 Flow guidelines:
-- Use plain text nodes (no bracketed tags).
-- Prefer labels like `step 1: ... (file)` for major calls/sections.
+- Use ASCII boxes for nodes (same box style as above).
+- Prefer labels like `step 1: ... (file)` inside the box.
 - Show cross-file transitions and major call flow.
 - Use `if <condition>` for branching when steps imply it (no yes/no labels).
 - Keep width under 90 characters.

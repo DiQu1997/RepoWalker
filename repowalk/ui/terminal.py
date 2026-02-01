@@ -6,14 +6,20 @@ import re
 import sys
 import textwrap
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
+from concurrent.futures import Future, ThreadPoolExecutor
 
 from pygments import lex
 from pygments.lexers import TextLexer, get_lexer_for_filename
 from pygments.token import Token
 from pygments.util import ClassNotFound
 
-from ..repo_scout.agent import CodeWalkerAgent
+from ..repo_scout.agent import (
+    CodeWalkerAgent,
+    CodeTutorAgent,
+    TutorContext,
+    TutorResponse,
+)
 from ..tui import WalkSession, UIStep
 
 COLOR_HEADER = 1
@@ -42,6 +48,8 @@ class UIState:
     session: WalkSession
     agent: CodeWalkerAgent
     debug: bool = False
+    tutor: Optional[CodeTutorAgent] = None
+    executor: Optional[ThreadPoolExecutor] = None
     focus: str = "code"
     view_mode: str = "split"
     split_ratio: float = 0.5
@@ -60,6 +68,15 @@ class UIState:
     search_selected: int = 0
     status_message: str = ""
     last_key: str = ""
+    qa_mode: bool = False
+    qa_input: str = ""
+    qa_cursor: int = 0
+    qa_response: str = ""
+    qa_history: List[Dict] = field(default_factory=list)
+    qa_loading: bool = False
+    qa_future: Optional[Future] = None
+    qa_pending_question: Optional[str] = None
+    current_step_id: Optional[int] = None
 
     def current_step(self) -> UIStep:
         return self.session.steps[self.session.current_step]
@@ -92,12 +109,33 @@ def _run_ui(
     curses.cbreak()
     stdscr.keypad(True)
     stdscr.nodelay(False)
-    stdscr.timeout(-1)
+    stdscr.timeout(100)
     _init_colors()
 
     state = UIState(session=session, agent=agent, debug=debug)
+    tutor = agent.tutor or CodeTutorAgent(
+        tools=agent.tools,
+        client=agent.client,
+        model=agent.model,
+        logger=agent.llm_logger,
+    )
+    executor = ThreadPoolExecutor(max_workers=1)
+    state.tutor = tutor
+    state.executor = executor
 
     while True:
+        step_id = state.session.current_step
+        if state.current_step_id != step_id:
+            state.current_step_id = step_id
+            state.qa_history = []
+            state.qa_response = ""
+            state.qa_input = ""
+            state.qa_cursor = 0
+            state.qa_mode = False
+            state.qa_future = None
+            state.qa_loading = False
+            state.qa_pending_question = None
+
         stdscr.erase()
         height, width = stdscr.getmaxyx()
 
@@ -115,7 +153,31 @@ def _run_ui(
 
         key = stdscr.getch()
         if key == -1:
+            if state.qa_loading and state.qa_future and state.qa_future.done():
+                response = state.qa_future.result()
+                state.qa_loading = False
+                state.qa_future = None
+                state.qa_response = _format_tutor_response(response)
+                state.qa_history.append(
+                    {
+                        "question": state.qa_pending_question or "",
+                        "answer": response.answer,
+                    }
+                )
+                state.qa_pending_question = None
             continue
+        if state.qa_loading and state.qa_future and state.qa_future.done():
+            response = state.qa_future.result()
+            state.qa_loading = False
+            state.qa_future = None
+            state.qa_response = _format_tutor_response(response)
+            state.qa_history.append(
+                {
+                    "question": state.qa_pending_question or "",
+                    "answer": response.answer,
+                }
+            )
+            state.qa_pending_question = None
         if not _handle_key(state, key):
             break
 
@@ -139,7 +201,35 @@ def _render_screen(stdscr, state: UIState, height: int, width: int) -> None:
     footer_h = 1
     data_h = 6 if state.data_structures_expanded else 3
     breadcrumb_h = 1 if state.show_breadcrumb else 0
-    main_h = height - header_h - data_h - breadcrumb_h - footer_h
+    qa_input_h = 3 if state.qa_mode or state.qa_response else 1
+    qa_response_h = (
+        min(5, len(state.qa_response.splitlines()) + 2)
+        if state.qa_response
+        else 0
+    )
+
+    min_main_h = 4
+    available = height - header_h - footer_h
+    overflow = (
+        min_main_h + qa_input_h + qa_response_h + breadcrumb_h + data_h
+        - available
+    )
+    if overflow > 0 and qa_response_h > 0:
+        shrink = min(overflow, qa_response_h)
+        qa_response_h -= shrink
+        overflow -= shrink
+    if overflow > 0 and data_h > 1:
+        shrink = min(overflow, data_h - 1)
+        data_h -= shrink
+        overflow -= shrink
+    if overflow > 0 and breadcrumb_h == 1:
+        breadcrumb_h = 0
+        overflow -= 1
+
+    main_h = max(
+        min_main_h,
+        available - qa_input_h - qa_response_h - breadcrumb_h - data_h,
+    )
     main_y = header_h
 
     _render_header(stdscr, state, 0, width)
@@ -156,9 +246,15 @@ def _render_screen(stdscr, state: UIState, height: int, width: int) -> None:
     data_y = main_y + main_h
     _render_data_structures(stdscr, state, data_y, data_h, width)
 
-    if state.show_breadcrumb:
-        breadcrumb_y = data_y + data_h
+    breadcrumb_y = data_y + data_h
+    if breadcrumb_h:
         _render_breadcrumb(stdscr, state, breadcrumb_y, width)
+
+    qa_y = breadcrumb_y + breadcrumb_h
+    if qa_response_h > 0:
+        _render_qa_response(stdscr, state, qa_y, qa_response_h, width)
+        qa_y += qa_response_h
+    _render_qa_input(stdscr, state, qa_y, qa_input_h, width)
 
     _render_footer(stdscr, state, height - 1, width)
 
@@ -180,6 +276,10 @@ def _render_footer(stdscr, state: UIState, y: int, width: int) -> None:
         "[Tab] Focus",
         "[d] Data",
         "[/] Search",
+        "[?] Ask",
+        "[Enter] Send",
+        "[Esc] Cancel",
+        "[c] Clear",
         "[q] Quit",
     ]
     if state.status_message:
@@ -434,6 +534,44 @@ def _render_search_overlay(stdscr, state: UIState, height: int, width: int) -> N
         row += 1
 
 
+def _render_qa_response(
+    stdscr, state: UIState, y: int, height: int, width: int
+) -> None:
+    if height <= 0:
+        return
+    _draw_box(stdscr, y, 0, height, width, title="Tutor")
+    lines = state.qa_response.splitlines()
+    wrapped: List[str] = []
+    for line in lines:
+        wrapped.extend(textwrap.wrap(line, width=max(10, width - 2)) or [""])
+    for i, line in enumerate(wrapped[: max(0, height - 2)]):
+        _safe_addstr(stdscr, y + 1 + i, 1, _truncate(line, width - 2))
+
+
+def _render_qa_input(
+    stdscr, state: UIState, y: int, height: int, width: int
+) -> None:
+    if height <= 0:
+        return
+    title = (
+        "Thinking..."
+        if state.qa_loading
+        else "Ask a question (? to focus, Enter to send)"
+    )
+    _draw_box(stdscr, y, 0, height, width, title=title)
+    if height < 2:
+        return
+    if state.qa_mode:
+        before = state.qa_input[: state.qa_cursor]
+        after = state.qa_input[state.qa_cursor :]
+        display = before + "█" + after
+        attr = curses.A_NORMAL
+    else:
+        display = state.qa_input if state.qa_input else "(Press ? to ask)"
+        attr = curses.A_DIM
+    _safe_addstr(stdscr, y + 1, 1, _truncate(display, width - 2), attr)
+
+
 def _handle_key(state: UIState, key: int) -> bool:
     state.last_key = _key_name(key)
 
@@ -446,6 +584,18 @@ def _handle_key(state: UIState, key: int) -> bool:
 
     if state.overlay_title:
         _handle_overlay_key(state, key)
+        return True
+
+    if state.qa_mode:
+        question = _handle_qa_input(state, key)
+        if question and state.tutor and state.executor:
+            state.qa_loading = True
+            state.qa_pending_question = question
+            state.qa_response = ""
+            context = _build_tutor_context(state)
+            state.qa_future = state.executor.submit(
+                state.tutor.answer_question, question, context
+            )
         return True
 
     if key in (curses.KEY_LEFT, ord("h")):
@@ -481,7 +631,11 @@ def _handle_key(state: UIState, key: int) -> bool:
         state.search_query = ""
         state.search_results = []
         state.search_selected = 0
-    elif key in (ord("?"),):
+    elif key == ord("?"):
+        if not state.qa_loading:
+            state.qa_mode = True
+            state.qa_cursor = len(state.qa_input)
+    elif key == ord("H"):
         _show_help(state)
     elif key == ord("r"):
         state.set_step(0)
@@ -489,6 +643,8 @@ def _handle_key(state: UIState, key: int) -> bool:
         _go_back(state)
     elif key in (10, 13):
         _dive_into_symbol(state)
+    elif key == ord("c"):
+        state.qa_response = ""
     return True
 
 
@@ -532,6 +688,86 @@ def _handle_overlay_key(state: UIState, key: int) -> None:
         state.overlay_scroll = min(
             max(0, len(state.overlay_lines) - 1), state.overlay_scroll + 1
         )
+
+
+def _handle_qa_input(state: UIState, key: int) -> Optional[str]:
+    if key in (27,):  # Esc
+        state.qa_mode = False
+        state.qa_input = ""
+        state.qa_cursor = 0
+        return None
+    if key in (10, 13):  # Enter
+        if state.qa_input.strip():
+            question = state.qa_input.strip()
+            state.qa_input = ""
+            state.qa_cursor = 0
+            state.qa_mode = False
+            return question
+        state.qa_mode = False
+        return None
+    if key in (curses.KEY_BACKSPACE, 127, 8):
+        if state.qa_cursor > 0:
+            state.qa_input = (
+                state.qa_input[: state.qa_cursor - 1]
+                + state.qa_input[state.qa_cursor :]
+            )
+            state.qa_cursor -= 1
+        return None
+    if key == curses.KEY_LEFT:
+        state.qa_cursor = max(0, state.qa_cursor - 1)
+        return None
+    if key == curses.KEY_RIGHT:
+        state.qa_cursor = min(len(state.qa_input), state.qa_cursor + 1)
+        return None
+    if key == curses.KEY_HOME:
+        state.qa_cursor = 0
+        return None
+    if key == curses.KEY_END:
+        state.qa_cursor = len(state.qa_input)
+        return None
+    if 32 <= key < 127:
+        char = chr(key)
+        state.qa_input = (
+            state.qa_input[: state.qa_cursor]
+            + char
+            + state.qa_input[state.qa_cursor :]
+        )
+        state.qa_cursor += 1
+    return None
+
+
+def _build_tutor_context(state: UIState) -> TutorContext:
+    step = state.current_step()
+    code_lines = step.code.splitlines()
+    end_line = step.start_line + max(0, len(code_lines) - 1)
+    overview_text = state.session.overview_summary or state.session.overview or ""
+    if state.session.overview_flow:
+        overview_text = overview_text + "\n\nFlow:\n" + state.session.overview_flow
+    return TutorContext(
+        step_title=step.title,
+        step_number=step.step_number,
+        file_path=step.file_path,
+        start_line=step.start_line,
+        end_line=end_line,
+        code=step.code,
+        explanation=step.explanation,
+        flow_diagram=step.flow,
+        walkthrough_title=state.session.title,
+        walkthrough_overview=overview_text,
+        walkthrough_flow=state.session.overview_flow,
+        total_steps=len(state.session.steps),
+        qa_history=list(state.qa_history),
+    )
+
+
+def _format_tutor_response(response: TutorResponse) -> str:
+    text = response.answer or ""
+    if response.follow_up_suggestions:
+        lines = ["", "Follow-ups:"]
+        for item in response.follow_up_suggestions[:3]:
+            lines.append(f"- {item}")
+        text = (text + "\n" + "\n".join(lines)).strip()
+    return text
 
 
 def _scroll_up(state: UIState) -> None:
@@ -624,7 +860,7 @@ def _show_help(state: UIState) -> None:
         "  Left/Right or h/l  - Prev/Next step",
         "  Up/Down or k/j     - Scroll focused panel",
         "  Tab                - Toggle focus",
-        "  1/2/3/4 or o        - View modes",
+        "  1/2/3/4 or o       - View modes",
         "  d                  - Toggle data structures",
         "  p                  - Toggle breadcrumb",
         "",
@@ -633,8 +869,15 @@ def _show_help(state: UIState) -> None:
         "  Enter              - Dive into symbol",
         "  Backspace          - Go back",
         "",
+        "Q&A:",
+        "  ?                  - Ask a question",
+        "  Enter              - Send (in Q&A mode)",
+        "  Esc                - Cancel input",
+        "  c                  - Clear response",
+        "",
         "General:",
         "  r                  - Restart",
+        "  H                  - Help",
         "  q                  - Quit",
         "  Esc                - Close overlays",
     ]

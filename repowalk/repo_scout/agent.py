@@ -34,6 +34,30 @@ class ToolResult:
     error: Optional[str] = None
 
 
+@dataclass
+class TutorContext:
+    step_title: str
+    step_number: int
+    file_path: str
+    start_line: int
+    end_line: int
+    code: str
+    explanation: str
+    flow_diagram: Optional[str] = None
+    walkthrough_title: str = ""
+    walkthrough_overview: str = ""
+    walkthrough_flow: Optional[str] = None
+    total_steps: int = 0
+    qa_history: List[Dict] = field(default_factory=list)
+
+
+@dataclass
+class TutorResponse:
+    answer: str
+    references: List[str] = field(default_factory=list)
+    follow_up_suggestions: List[str] = field(default_factory=list)
+
+
 class Phase(Enum):
     EXPLORE = "explore"
     PLAN = "plan"
@@ -206,6 +230,235 @@ class LLMCallLogger:
             parts.append(f"{role}: {content}")
         parts.append(f"LLM({model}, {params}): {response}")
         return "\n\n".join(parts)
+
+
+class CodeTutorAgent:
+    SYSTEM_PROMPT = """You are a code tutor helping someone understand a codebase.
+
+You are currently explaining step {step_number} of {total_steps} in a walkthrough titled "{walkthrough_title}".
+
+## Current Step Context
+
+Title: {step_title}
+File: {file_path} (lines {start_line}-{end_line})
+
+Code (line-numbered):
+{code}
+
+Pre-generated explanation:
+{explanation}
+
+Step flow diagram:
+{flow_diagram}
+
+## Walkthrough Overview
+{walkthrough_overview}
+
+## Walkthrough Flow
+{walkthrough_flow}
+
+## Your Role
+
+1. Answer the user's question clearly and concisely
+2. Reference specific line numbers when discussing code
+3. Connect concepts to the broader walkthrough context when relevant
+4. Use analogies or small examples to clarify complex ideas
+5. If the question is about code outside this step, request a tool
+
+## Tool Requests
+
+If you need more context from other files, respond with exactly:
+TOOL: <tool_name> <json>
+
+Available tools:
+- read_file {{"path": "path", "start_line": 1, "end_line": 200}}
+- search_code {{"pattern": "regex", "file_pattern": "*.py"}}
+- find_definition {{"symbol": "Name"}}
+- find_usages {{"symbol": "Name"}}
+
+Otherwise, answer normally. You may optionally include a brief section:
+Follow-ups:
+- question 1
+- question 2
+"""
+
+    def __init__(
+        self,
+        tools: CodeWalkerTools,
+        client: LLMClient,
+        model: str,
+        logger: Optional[LLMCallLogger] = None,
+    ):
+        self.tools = tools
+        self.client = client
+        self.model = model
+        self.logger = logger
+
+    def answer_question(self, question: str, context: TutorContext) -> TutorResponse:
+        system = self._build_system_prompt(context)
+        messages: List[Dict[str, str]] = [{"role": "system", "content": system}]
+        for qa in context.qa_history:
+            messages.append({"role": "user", "content": qa.get("question", "")})
+            messages.append({"role": "assistant", "content": qa.get("answer", "")})
+        messages.append({"role": "user", "content": question})
+
+        response_text = self._call_llm(
+            messages,
+            max_output_tokens=2000,
+            purpose="tutor_qa",
+            prompt_parts={
+                "question": question,
+                "context": {
+                    "step_title": context.step_title,
+                    "file_path": context.file_path,
+                    "start_line": context.start_line,
+                    "end_line": context.end_line,
+                },
+            },
+        )
+
+        tool_turns = 0
+        while True:
+            tool_call = self._parse_tool_request(response_text)
+            if not tool_call or tool_turns >= 3:
+                break
+            tool_turns += 1
+            name, args = tool_call
+            tool_result = self._execute_tool(name, args)
+            messages.append({"role": "assistant", "content": response_text})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": f"Tool result ({name} {args}):\n{tool_result}",
+                }
+            )
+            response_text = self._call_llm(
+                messages,
+                max_output_tokens=2000,
+                purpose="tutor_qa",
+                prompt_parts={
+                    "question": question,
+                    "tool": {"name": name, "args": args},
+                },
+            )
+
+        answer, follow_ups = self._extract_follow_ups(response_text)
+        return TutorResponse(answer=answer, follow_up_suggestions=follow_ups)
+
+    def _build_system_prompt(self, context: TutorContext) -> str:
+        code_with_lines = self._format_code_with_lines(
+            context.code, context.start_line
+        )
+        walkthrough_flow = context.walkthrough_flow or "(none)"
+        flow_diagram = context.flow_diagram or "(none)"
+        walkthrough_overview = context.walkthrough_overview or "(none)"
+        return self.SYSTEM_PROMPT.format(
+            step_number=context.step_number,
+            total_steps=context.total_steps,
+            walkthrough_title=context.walkthrough_title,
+            step_title=context.step_title,
+            file_path=context.file_path,
+            start_line=context.start_line,
+            end_line=context.end_line,
+            code=code_with_lines,
+            explanation=context.explanation or "(none)",
+            flow_diagram=flow_diagram,
+            walkthrough_overview=walkthrough_overview,
+            walkthrough_flow=walkthrough_flow,
+        )
+
+    def _format_code_with_lines(self, code: str, start_line: int) -> str:
+        lines = code.splitlines()
+        if not lines:
+            return "(no code)"
+        first = lines[0]
+        if re.match(r"\s*\d+\s*\|\s", first):
+            return code
+        return "\n".join(
+            f"{i:>4} | {line}"
+            for i, line in enumerate(lines, start_line)
+        )
+
+    def _parse_tool_request(
+        self, text: str
+    ) -> Optional[tuple[str, Dict[str, Any]]]:
+        if not text:
+            return None
+        match = re.match(r"^\s*TOOL:\s*(\w+)\s*(\{.*\})\s*$", text, re.DOTALL)
+        if not match:
+            return None
+        name = match.group(1).strip()
+        payload = match.group(2).strip()
+        try:
+            args = json.loads(payload)
+        except json.JSONDecodeError:
+            return None
+        return name, args
+
+    def _execute_tool(self, name: str, args: Dict[str, Any]) -> str:
+        if name == "read_file":
+            result = self.tools.read_file(
+                args.get("path", ""),
+                start_line=args.get("start_line"),
+                end_line=args.get("end_line"),
+            )
+        elif name == "search_code":
+            result = self.tools.grep(
+                args.get("pattern", ""),
+                file_pattern=args.get("file_pattern"),
+            )
+        elif name == "find_definition":
+            result = self.tools.find_definition(args.get("symbol", ""))
+        elif name == "find_usages":
+            result = self.tools.find_usages(args.get("symbol", ""))
+        else:
+            return f"(unknown tool: {name})"
+        if result.success:
+            return result.output
+        return result.error or "(tool failed)"
+
+    def _extract_follow_ups(self, answer: str) -> tuple[str, List[str]]:
+        lines = answer.splitlines()
+        follow_ups: List[str] = []
+        cleaned: List[str] = []
+        in_follow = False
+        for line in lines:
+            if re.match(r"^\s*Follow-ups?:\s*$", line, re.IGNORECASE):
+                in_follow = True
+                continue
+            if in_follow:
+                if not line.strip():
+                    continue
+                if re.match(r"^\s*[-*]\s+", line):
+                    follow_ups.append(line.strip()[2:].strip())
+                    continue
+                # Stop if non-bullet content appears
+                in_follow = False
+            if not in_follow:
+                cleaned.append(line)
+        cleaned_answer = "\n".join(cleaned).strip()
+        return cleaned_answer, follow_ups
+
+    def _call_llm(
+        self,
+        messages: List[Dict[str, str]],
+        max_output_tokens: int,
+        purpose: str,
+        prompt_parts: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        response = self.client.generate(messages, max_output_tokens=max_output_tokens)
+        if self.logger:
+            self.logger.log_call(
+                caller="CodeTutorAgent.answer_question",
+                phase=None,
+                purpose=purpose,
+                model=self.model,
+                params={"max_output_tokens": max_output_tokens},
+                messages=messages,
+                response=response,
+                prompt_parts=prompt_parts,
+            )
+        return response
 
 
 def _load_env_file(path: Path) -> None:
@@ -787,6 +1040,7 @@ class CodeWalkerAgent:
         verbose: bool = False,
         pause_between_steps: bool = True,
         flow_diagrams: bool = False,
+        qa_enabled: bool = True,
         llm_log: bool = False,
         llm_log_path: Optional[str] = None,
         client: Optional[LLMClient] = None,
@@ -799,7 +1053,18 @@ class CodeWalkerAgent:
         self.verbose = verbose
         self.pause_between_steps = pause_between_steps
         self.flow_diagrams = flow_diagrams
+        self.qa_enabled = qa_enabled
         self.llm_logger = self._init_llm_logger(llm_log, llm_log_path)
+        self.tutor = (
+            CodeTutorAgent(
+                tools=self.tools,
+                client=self.client,
+                model=self.model,
+                logger=self.llm_logger,
+            )
+            if self.qa_enabled
+            else None
+        )
 
     def run(self, user_request: str) -> None:
         self.prepare_plan(user_request)
@@ -1242,7 +1507,11 @@ class CodeWalkerAgent:
         for index, step in enumerate(self.state.plan.steps):
             self.state.current_step = index + 1
             self._present_step(step)
-            if index < len(self.state.plan.steps) - 1 and self.pause_between_steps:
+            if (
+                index < len(self.state.plan.steps) - 1
+                and self.pause_between_steps
+                and not self.qa_enabled
+            ):
                 input("\n[Press Enter for next step...]\n")
         print("\n" + "=" * 60)
         print("Walk-through complete!")
@@ -1288,6 +1557,7 @@ class CodeWalkerAgent:
         print(code)
 
         print("```")
+        flow = ""
         if self.flow_diagrams:
             flow = self._generate_step_flow(step, code)
             if flow.strip():
@@ -1311,6 +1581,59 @@ class CodeWalkerAgent:
         print(explanation)
         if step.leads_to:
             print(f"\nNext: {step.leads_to}")
+        if self.qa_enabled and self.tutor and self.state and self.state.plan:
+            cleaned_code, inferred_start = self._strip_line_numbers(code)
+            start_line = step.start_line or inferred_start or 1
+            end_line = (
+                start_line + max(0, len(cleaned_code.splitlines()) - 1)
+                if cleaned_code
+                else start_line
+            )
+            overview_text = self.state.overview_summary or self.state.plan.overview
+            if self.state.overview_flow:
+                overview_text = (
+                    overview_text + "\n\nFlow:\n" + self.state.overview_flow
+                )
+            context = TutorContext(
+                step_title=step.title,
+                step_number=step.step_number,
+                file_path=step.file_path,
+                start_line=start_line,
+                end_line=end_line,
+                code=cleaned_code,
+                explanation=explanation,
+                flow_diagram=flow or None,
+                walkthrough_title=self.state.plan.title,
+                walkthrough_overview=overview_text,
+                walkthrough_flow=self.state.overview_flow,
+                total_steps=self.state.plan.total_steps,
+                qa_history=[],
+            )
+            self._interactive_qa_loop(context)
+
+    def _interactive_qa_loop(self, context: TutorContext) -> None:
+        while True:
+            print()
+            user_input = input(
+                "Press Enter to continue, or ask a question: "
+            ).strip()
+            if not user_input:
+                break
+            print("\n" + "-" * 60)
+            print("Tutor:\n")
+            response = self.tutor.answer_question(user_input, context)
+            print(response.answer)
+            if response.follow_up_suggestions:
+                print("\nYou might also ask:")
+                for suggestion in response.follow_up_suggestions[:3]:
+                    print(f"  - {suggestion}")
+            print("-" * 60)
+            context.qa_history.append(
+                {
+                    "question": user_input,
+                    "answer": response.answer,
+                }
+            )
 
     def _get_step_code(self, step: WalkStep) -> str:
         file_path, start_hint, end_hint = self._split_path_and_line_info(
@@ -1438,6 +1761,23 @@ class CodeWalkerAgent:
                 },
             },
         )
+
+    def _strip_line_numbers(
+        self, code: str
+    ) -> tuple[str, Optional[int]]:
+        lines = code.splitlines()
+        start_line: Optional[int] = None
+        cleaned_lines: List[str] = []
+        for line in lines:
+            match = re.match(r"\s*(\d+)\s*\|\s?(.*)$", line)
+            if match:
+                if start_line is None:
+                    start_line = int(match.group(1))
+                cleaned_lines.append(match.group(2))
+            else:
+                cleaned_lines.append(line)
+        cleaned = "\n".join(cleaned_lines).rstrip()
+        return cleaned, start_line
 
     # ===== Parsing Helpers =====
 

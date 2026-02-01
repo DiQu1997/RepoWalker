@@ -61,6 +61,7 @@ def main(argv: list[str] | None = None) -> int:
             verbose=args.verbose,
             pause_between_steps=not args.no_pause,
             flow_diagrams=args.flow,
+            qa_enabled=not args.no_pause,
             llm_log=args.llm_log,
             llm_log_path=args.llm_log_path,
         )
